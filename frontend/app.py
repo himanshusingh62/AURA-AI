@@ -6,8 +6,10 @@ Provides concurrent multi-document PDF semantic retrieval, visual diagram compre
 
 from __future__ import annotations
 
+import hashlib
 import html
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -119,6 +121,12 @@ def handle_pdf_upload(file_bytes: bytes, filename: str) -> bool:
     clean_name = safe_filename(filename)
     full_hash = file_hash(file_bytes)
     sha_hash = full_hash[:12]
+
+    # Check if this exact PDF is already indexed to prevent duplicate chunks in vector store
+    if full_hash in st.session_state.uploaded_docs:
+        st.session_state.processed_upload_hashes.add(full_hash)
+        st.toast(f"PDF '{clean_name}' is already indexed in your workspace.", icon="ℹ️")
+        return True
 
     # Handle same-name PDFs by establishing distinct source identifiers if needed
     existing_names = [d.get("name") for d in st.session_state.uploaded_docs.values()]
@@ -315,6 +323,12 @@ def handle_image_upload(file_bytes: bytes, filename: str) -> bool:
     clean_name = safe_filename(filename)
     full_hash = file_hash(file_bytes)
 
+    # Check if this exact image is already active in workspace
+    if any(file_hash(i.raw_bytes) == full_hash for i in st.session_state.active_images if getattr(i, "raw_bytes", None)):
+        st.session_state.processed_upload_hashes.add(full_hash)
+        st.toast(f"Image '{clean_name}' is already active in your workspace.", icon="ℹ️")
+        return True
+
     is_valid, val_err = validate_image(file_bytes, clean_name)
     if not is_valid:
         st.error(f"❌ {val_err}")
@@ -492,28 +506,6 @@ def process_incoming_files(uploaded_files: list) -> bool:
             st.session_state.processing_hashes.discard(h)
 
     return has_state_changed
-    for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.read()
-        uploaded_file.seek(0)
-        h = file_hash(file_bytes)
-
-        if h in st.session_state.processed_upload_hashes:
-            continue
-
-        name = safe_filename(uploaded_file.name)
-        if is_pdf(name):
-            ok = handle_pdf_upload(file_bytes, name)
-            if ok:
-                has_state_changed = True
-        elif is_image(name):
-            ok = handle_image_upload(file_bytes, name)
-            if ok:
-                has_state_changed = True
-        else:
-            st.error(f"Unsupported file type: {html.escape(name)}")
-            st.session_state.processed_upload_hashes.add(h)
-
-    return has_state_changed
 
 
 # ── Sidebar Navigation & Management ────────────────────────────────────────
@@ -600,9 +592,10 @@ def render_sidebar() -> None:
                     )
 
             if has_imgs:
-                for img_item in st.session_state.active_images:
+                for idx, img_item in enumerate(st.session_state.active_images):
                     safe_img_name = html.escape(str(img_item.filename))
                     safe_img_format = html.escape(str(img_item.format))
+                    img_uid = file_hash(img_item.raw_bytes)[:10] if getattr(img_item, "raw_bytes", None) else str(idx)
                     col_im1, col_im2 = st.columns([5, 1])
                     with col_im1:
                         st.markdown(
@@ -622,8 +615,8 @@ def render_sidebar() -> None:
                             unsafe_allow_html=True,
                         )
                     with col_im2:
-                        if st.button("×", key=f"rm_sb_img_{img_item.filename}", help="Remove from active context"):
-                            st.session_state.active_images = [i for i in st.session_state.active_images if i.filename != img_item.filename]
+                        if st.button("×", key=f"rm_sb_img_{idx}_{img_uid}", help="Remove from active context"):
+                            st.session_state.active_images = [i for j, i in enumerate(st.session_state.active_images) if j != idx]
                             st.rerun()
 
         # 4. Scope Filter for Multi-PDF queries
@@ -750,13 +743,35 @@ def render_suggested_prompts(has_pdf: bool, has_images: bool) -> None:
 
 # ── Quick-Load Workspace Files ─────────────────────────────────────────────
 def render_workspace_shelf() -> None:
-    """Show available sample files found in workspace for 1-click loading."""
+    """Show available sample files found in workspace for 1-click loading.
+    Uses genuinely unique, stable document identifiers and handles identical filenames correctly.
+    """
     workspace_dir = Path(__file__).resolve().parent.parent
-    sample_pdfs = list(workspace_dir.glob("*.pdf")) + [
+
+    # Collect sample PDFs with deduplication by resolved filesystem path
+    seen_pdf_paths: set[Path] = set()
+    candidate_pdfs = list(workspace_dir.glob("*.pdf")) + [
         p for p in (workspace_dir / "tests").glob("*.pdf")
         if "corrupt" not in p.name.lower() and "empty" not in p.name.lower()
     ]
-    sample_imgs = [p for p in workspace_dir.glob("*.*") if p.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS]
+    sample_pdfs: list[Path] = []
+    for p in candidate_pdfs:
+        res = p.resolve()
+        if res not in seen_pdf_paths and p.is_file():
+            seen_pdf_paths.add(res)
+            sample_pdfs.append(p)
+
+    # Collect sample images with deduplication by resolved filesystem path
+    seen_img_paths: set[Path] = set()
+    candidate_imgs = [p for p in workspace_dir.glob("*.*") if p.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS] + [
+        p for p in (workspace_dir / "tests").glob("*.*") if p.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS
+    ]
+    sample_imgs: list[Path] = []
+    for p in candidate_imgs:
+        res = p.resolve()
+        if res not in seen_img_paths and p.is_file():
+            seen_img_paths.add(res)
+            sample_imgs.append(p)
 
     if not sample_pdfs and not sample_imgs:
         return
@@ -770,9 +785,30 @@ def render_workspace_shelf() -> None:
         unsafe_allow_html=True,
     )
 
-    for pdf in sample_pdfs[:2]:
+    pdf_name_counts = Counter(p.name for p in sample_pdfs)
+
+    for pdf in sample_pdfs[:4]:
         size_kb = pdf.stat().st_size / 1024
         safe_pdf_name = html.escape(pdf.name)
+
+        # Genuinely unique, stable document identifier based on resolved canonical path
+        doc_uid = hashlib.sha256(str(pdf.resolve()).encode("utf-8")).hexdigest()[:12]
+
+        # Disambiguate identical filenames by displaying parent directory if needed
+        if pdf_name_counts[pdf.name] > 1:
+            try:
+                rel_parent = pdf.relative_to(workspace_dir).parent.as_posix()
+                type_desc = f"PDF Document ({rel_parent}/)" if rel_parent != "." else "PDF Document (root/)"
+            except Exception:
+                type_desc = f"PDF Document ({pdf.parent.name}/)"
+        else:
+            type_desc = "PDF Document"
+
+        # Check if already indexed in active session
+        file_bytes = pdf.read_bytes()
+        full_hash = file_hash(file_bytes)
+        is_already_indexed = full_hash in st.session_state.uploaded_docs
+
         col_f1, col_f2 = st.columns([4, 1.2])
         with col_f1:
             st.markdown(
@@ -781,7 +817,7 @@ def render_workspace_shelf() -> None:
                     <div style="font-size: 1.3rem;">📄</div>
                     <div>
                         <div style="font-size: 0.88rem; font-weight: 600; color: #f8fafc;">{safe_pdf_name}</div>
-                        <div style="font-size: 0.74rem; color: #64748b;">PDF Document · {size_kb:.1f} KB</div>
+                        <div style="font-size: 0.74rem; color: #64748b;">{type_desc} · {size_kb:.1f} KB</div>
                     </div>
                 </div>
                 """,
@@ -789,14 +825,38 @@ def render_workspace_shelf() -> None:
             )
         with col_f2:
             st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-            if st.button("Analyze", key=f"load_ws_pdf_{pdf.name}", use_container_width=True):
-                handle_pdf_upload(pdf.read_bytes(), pdf.name)
-                st.rerun()
+            btn_key = f"load_ws_pdf_{doc_uid}"
+            if is_already_indexed:
+                st.button("✓ Active", key=btn_key, use_container_width=True, disabled=True)
+            else:
+                if st.button("Analyze", key=btn_key, use_container_width=True):
+                    handle_pdf_upload(file_bytes, pdf.name)
+                    st.rerun()
 
-    for img in sample_imgs[:2]:
+    img_name_counts = Counter(p.name for p in sample_imgs)
+
+    for img in sample_imgs[:4]:
         size_kb = img.stat().st_size / 1024
         safe_img_name = html.escape(img.name)
         safe_ext_name = html.escape(img.suffix.upper()[1:])
+
+        img_uid = hashlib.sha256(str(img.resolve()).encode("utf-8")).hexdigest()[:12]
+
+        if img_name_counts[img.name] > 1:
+            try:
+                rel_parent = img.relative_to(workspace_dir).parent.as_posix()
+                type_desc = f"Visual Image ({safe_ext_name} · {rel_parent}/)" if rel_parent != "." else f"Visual Image ({safe_ext_name} · root/)"
+            except Exception:
+                type_desc = f"Visual Image ({safe_ext_name} · {img.parent.name}/)"
+        else:
+            type_desc = f"Visual Image ({safe_ext_name})"
+
+        img_bytes = img.read_bytes()
+        full_hash = file_hash(img_bytes)
+        is_already_active = any(
+            file_hash(i.raw_bytes) == full_hash for i in st.session_state.active_images if getattr(i, "raw_bytes", None)
+        )
+
         col_f1, col_f2 = st.columns([4, 1.2])
         with col_f1:
             st.markdown(
@@ -805,7 +865,7 @@ def render_workspace_shelf() -> None:
                     <div style="font-size: 1.3rem;">🖼️</div>
                     <div>
                         <div style="font-size: 0.88rem; font-weight: 600; color: #f8fafc;">{safe_img_name}</div>
-                        <div style="font-size: 0.74rem; color: #64748b;">Visual Image ({safe_ext_name}) · {size_kb:.1f} KB</div>
+                        <div style="font-size: 0.74rem; color: #64748b;">{type_desc} · {size_kb:.1f} KB</div>
                     </div>
                 </div>
                 """,
@@ -813,9 +873,13 @@ def render_workspace_shelf() -> None:
             )
         with col_f2:
             st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-            if st.button("Load Image", key=f"load_ws_img_{img.name}", use_container_width=True):
-                handle_image_upload(img.read_bytes(), img.name)
-                st.rerun()
+            btn_key = f"load_ws_img_{img_uid}"
+            if is_already_active:
+                st.button("✓ Active", key=btn_key, use_container_width=True, disabled=True)
+            else:
+                if st.button("Load Image", key=btn_key, use_container_width=True):
+                    handle_image_upload(img_bytes, img.name)
+                    st.rerun()
 
 
 # ── Chat Tab View ──────────────────────────────────────────────────────────
@@ -1117,11 +1181,21 @@ def render_document_hub_tab() -> None:
         if not st.session_state.active_images and not st.session_state.uploaded_images:
             st.info("No visual images currently loaded. Upload images (.png, .jpg, .jpeg, .webp) from the sidebar.", icon="🖼️")
         else:
-            all_imgs = {img.filename: img for img in st.session_state.active_images}
-            all_imgs.update(st.session_state.uploaded_images)
+            all_imgs: dict[str, ProcessedImage] = {}
+            for img in st.session_state.active_images:
+                uid = file_hash(img.raw_bytes) if getattr(img, "raw_bytes", None) else img.filename
+                all_imgs[uid] = img
+            for name, img in st.session_state.uploaded_images.items():
+                if isinstance(img, ProcessedImage):
+                    uid = file_hash(img.raw_bytes) if getattr(img, "raw_bytes", None) else name
+                    all_imgs[uid] = img
 
-            for ifname, pimg in all_imgs.items():
-                is_in_active = any(i.filename == ifname for i in st.session_state.active_images)
+            for img_uid, pimg in all_imgs.items():
+                is_in_active = any(
+                    (file_hash(i.raw_bytes) == img_uid if getattr(i, "raw_bytes", None) else i.filename == pimg.filename)
+                    for i in st.session_state.active_images
+                )
+                safe_short_uid = img_uid[:12]
                 col_i1, col_i2 = st.columns([1, 4])
                 safe_ifname = html.escape(str(pimg.filename))
                 safe_iformat = html.escape(str(pimg.format))
@@ -1144,19 +1218,25 @@ def render_document_hub_tab() -> None:
                     col_b1, col_b2, col_b3 = st.columns([2.5, 2.5, 5])
                     with col_b1:
                         if is_in_active:
-                            if st.button("Exclude from Context", key=f"excl_img_{ifname}", use_container_width=True):
-                                st.session_state.active_images = [i for i in st.session_state.active_images if i.filename != ifname]
+                            if st.button("Exclude from Context", key=f"excl_img_{safe_short_uid}", use_container_width=True):
+                                st.session_state.active_images = [
+                                    i for i in st.session_state.active_images
+                                    if (file_hash(i.raw_bytes) != img_uid if getattr(i, "raw_bytes", None) else i.filename != pimg.filename)
+                                ]
                                 st.rerun()
                         else:
-                            if st.button("Include in Context", key=f"incl_img_{ifname}", use_container_width=True):
+                            if st.button("Include in Context", key=f"incl_img_{safe_short_uid}", use_container_width=True):
                                 st.session_state.active_images.append(pimg)
                                 st.rerun()
                     with col_b2:
-                        if st.button("🗑️ Delete Image", key=f"del_img_{ifname}", use_container_width=True):
-                            st.session_state.active_images = [i for i in st.session_state.active_images if i.filename != ifname]
-                            if ifname in st.session_state.uploaded_images:
-                                del st.session_state.uploaded_images[ifname]
-                            st.toast(f"Image '{ifname}' deleted.", icon="🗑️")
+                        if st.button("🗑️ Delete Image", key=f"del_img_{safe_short_uid}", use_container_width=True):
+                            st.session_state.active_images = [
+                                i for i in st.session_state.active_images
+                                if (file_hash(i.raw_bytes) != img_uid if getattr(i, "raw_bytes", None) else i.filename != pimg.filename)
+                            ]
+                            st.session_state.uploaded_images.pop(pimg.filename, None)
+                            st.session_state.uploaded_images.pop(img_uid, None)
+                            st.toast(f"Image '{safe_ifname}' deleted.", icon="🗑️")
                             st.rerun()
 
 
