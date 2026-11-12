@@ -1,0 +1,19 @@
+# Core Framework & UI
+streamlit>=1.45.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+
+# Official Modern Google GenAI SDK (Replaces legacy google-generativeai)
+google-genai>=3.0.0,<4.0.0
+
+# Document Indexing & RAG Core (Clean native integration without deprecated wrappers)
+llama-index-core>=0.12.0,<1.0.0
+
+# PDF & Image Processing
+PyMuPDF>=1.25.0,<2.0.0
+pillow>=10.0.0,<12.0.0
+
+# Environment & Configuration
+python-dotenv>=1.1.0,<2.0.0
+
+# Testing & Quality Assurance
+pytest>=8.0.0,<10.0.0
